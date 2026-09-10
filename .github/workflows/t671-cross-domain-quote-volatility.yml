@@ -1,0 +1,45 @@
+name: T671 Cross-Domain Quote Volatility Reserve
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  t671-quote-volatility:
+    name: T671 read-only quote-volatility capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Capture repeated tightly paired quotes
+        run: python3 cross_domain_quote_volatility_reserve.py
+
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf t671-quote-volatility-reserve-evidence.tgz live-evidence
+          sha256sum t671-quote-volatility-reserve-evidence.tgz \
+            > t671-quote-volatility-reserve-evidence.tgz.sha256
+
+      - name: Upload T671 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t671-quote-volatility-reserve-${{ github.run_id }}
+          path: |
+            live-evidence/
+            t671-quote-volatility-reserve-evidence.tgz
+            t671-quote-volatility-reserve-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
