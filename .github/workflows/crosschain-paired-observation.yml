@@ -1,0 +1,311 @@
+name: Cross-Chain Paired Observation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Solana-Arbitrum paired USDC-USDT observation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Capture paired market evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import ssl
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode, urlparse
+
+          SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          SOL_USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+          ARB_USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+          ARB_USDT = "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+          NOTIONAL_USDC = 10_000_000  # 10 USDC
+          DECIMALS = 6
+          RAYDIUM_HOST = "transaction-v1.raydium.io"
+          PARA_HOST = "api.paraswap.io"
+          SOL_RPC = "https://api.mainnet-beta.solana.com"
+          ARB_RPC = "https://arb1.arbitrum.io/rpc"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00", "Z")
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def request(host, method, target, body=None, content_type=None):
+              if body is None:
+                  body = b""
+              headers = [
+                  ("Host", host),
+                  ("User-Agent", "Scout-CrossChain-Paired-Observer/1.0.0"),
+                  ("Accept", "application/json"),
+                  ("Accept-Encoding", "identity"),
+                  ("Cache-Control", "no-cache"),
+                  ("Connection", "close"),
+              ]
+              if content_type:
+                  headers.append(("Content-Type", content_type))
+              if body:
+                  headers.append(("Content-Length", str(len(body))))
+
+              request_bytes = (
+                  f"{method} {target} HTTP/1.1\r\n"
+                  + "".join(f"{k}: {v}\r\n" for k, v in headers)
+                  + "\r\n"
+              ).encode("ascii") + body
+
+              started = now()
+              mono = time.monotonic_ns()
+              conn = http.client.HTTPSConnection(
+                  host, 443, timeout=30, context=ssl.create_default_context()
+              )
+              try:
+                  conn.putrequest(
+                      method, target, skip_host=True, skip_accept_encoding=True
+                  )
+                  for k, v in headers:
+                      conn.putheader(k, v)
+                  conn.endheaders(body if body else None)
+                  resp = conn.getresponse()
+                  raw = resp.read()
+                  status = resp.status
+              finally:
+                  conn.close()
+
+              return {
+                  "started_at_utc": started,
+                  "completed_at_utc": now(),
+                  "duration_ms": round(
+                      (time.monotonic_ns() - mono) / 1_000_000, 3
+                  ),
+                  "http_status": status,
+                  "request_bytes": request_bytes,
+                  "response_bytes": raw,
+                  "request_sha256": sha256(request_bytes),
+                  "response_sha256": sha256(raw),
+                  "json": json.loads(raw.decode("utf-8")),
+              }
+
+          def raydium_quote(src, dst, amount):
+              query = urlencode([
+                  ("inputMint", src),
+                  ("outputMint", dst),
+                  ("amount", str(amount)),
+                  ("slippageBps", "50"),
+                  ("txVersion", "V0"),
+              ])
+              target = f"/compute/swap-base-in?{query}"
+              r = request(RAYDIUM_HOST, "GET", target)
+              data = r["json"].get("data") if isinstance(r["json"], dict) else None
+              ok = (
+                  r["http_status"] == 200
+                  and isinstance(r["json"], dict)
+                  and r["json"].get("success") is True
+                  and isinstance(data, dict)
+                  and str(data.get("outputAmount", "")).isdigit()
+              )
+              if not ok:
+                  raise SystemExit(f"Raydium quote failed: {r['json']}")
+              r["output_amount"] = int(data["outputAmount"])
+              return r
+
+          def paraswap_quote(src, dst, amount):
+              query = urlencode([
+                  ("srcToken", src),
+                  ("destToken", dst),
+                  ("amount", str(amount)),
+                  ("srcDecimals", str(DECIMALS)),
+                  ("destDecimals", str(DECIMALS)),
+                  ("side", "SELL"),
+                  ("network", "42161"),
+              ])
+              target = f"/prices?{query}"
+              r = request(PARA_HOST, "GET", target)
+              route = r["json"].get("priceRoute") if isinstance(r["json"], dict) else None
+              ok = (
+                  r["http_status"] == 200
+                  and isinstance(route, dict)
+                  and str(route.get("destAmount", "")).isdigit()
+              )
+              if not ok:
+                  raise SystemExit(f"Arbitrum quote failed: {r['json']}")
+              r["output_amount"] = int(route["destAmount"])
+              r["gas_cost_usd"] = route.get("gasCostUSD")
+              return r
+
+          def rpc(endpoint, method, params, request_id):
+              parsed = urlparse(endpoint)
+              body = json.dumps(
+                  {
+                      "jsonrpc": "2.0",
+                      "id": request_id,
+                      "method": method,
+                      "params": params,
+                  },
+                  separators=(",", ":"),
+              ).encode("utf-8")
+              r = request(
+                  parsed.netloc,
+                  "POST",
+                  parsed.path or "/",
+                  body=body,
+                  content_type="application/json",
+              )
+              if r["http_status"] != 200 or "error" in r["json"]:
+                  raise SystemExit(f"{method} failed: {r['json']}")
+              return r
+
+          root = Path("paired-evidence")
+          root.mkdir()
+
+          # Chain-state anchors first.
+          sol_slot = rpc(SOL_RPC, "getSlot", [{"commitment": "finalized"}], 1)
+          arb_block = rpc(ARB_RPC, "eth_blockNumber", [], 2)
+          arb_gas = rpc(ARB_RPC, "eth_gasPrice", [], 3)
+
+          # Direction A: buy USDT on Solana with 10 USDC, then sell the same
+          # USDT amount on Arbitrum.
+          sol_buy = raydium_quote(SOL_USDC, SOL_USDT, NOTIONAL_USDC)
+          arb_sell_same = paraswap_quote(
+              ARB_USDT, ARB_USDC, sol_buy["output_amount"]
+          )
+
+          # Direction B: buy USDT on Arbitrum with 10 USDC, then sell the same
+          # USDT amount on Solana.
+          arb_buy = paraswap_quote(ARB_USDC, ARB_USDT, NOTIONAL_USDC)
+          sol_sell_same = raydium_quote(
+              SOL_USDT, SOL_USDC, arb_buy["output_amount"]
+          )
+
+          dir_a_out = arb_sell_same["output_amount"]
+          dir_b_out = sol_sell_same["output_amount"]
+
+          dir_a_profit = dir_a_out - NOTIONAL_USDC
+          dir_b_profit = dir_b_out - NOTIONAL_USDC
+
+          def bps(delta, base):
+              return delta * 10000.0 / base
+
+          records = {
+              "solana_getSlot": sol_slot,
+              "arbitrum_eth_blockNumber": arb_block,
+              "arbitrum_eth_gasPrice": arb_gas,
+              "solana_buy_usdt": sol_buy,
+              "arbitrum_sell_same_usdt": arb_sell_same,
+              "arbitrum_buy_usdt": arb_buy,
+              "solana_sell_same_usdt": sol_sell_same,
+          }
+
+          for name, rec in records.items():
+              (root / f"{name}_request.http").write_bytes(rec["request_bytes"])
+              (root / f"{name}_response.body").write_bytes(rec["response_bytes"])
+
+          evidence = {
+              "schema": "scout.crosschain_paired_observation.v1",
+              "observation_only": True,
+              "execution_authority": False,
+              "chains": ["solana-mainnet", "arbitrum-one"],
+              "pair": "USDC/USDT",
+              "notional_usdc_units": 10.0,
+              "notional_usdc_base_units": NOTIONAL_USDC,
+              "chain_state": {
+                  "solana_finalized_slot": sol_slot["json"].get("result"),
+                  "arbitrum_block_number_hex": arb_block["json"].get("result"),
+                  "arbitrum_gas_price_wei_hex": arb_gas["json"].get("result"),
+              },
+              "direction_a_sol_buy_arb_sell": {
+                  "solana_usdt_bought_base_units": sol_buy["output_amount"],
+                  "solana_usdt_bought_units": sol_buy["output_amount"] / 1_000_000,
+                  "arbitrum_usdc_received_base_units": dir_a_out,
+                  "arbitrum_usdc_received_units": dir_a_out / 1_000_000,
+                  "gross_cycle_delta_usdc_base_units": dir_a_profit,
+                  "gross_cycle_delta_usdc_units": dir_a_profit / 1_000_000,
+                  "gross_cycle_delta_bps": bps(dir_a_profit, NOTIONAL_USDC),
+                  "arbitrum_quote_gas_cost_usd": arb_sell_same.get("gas_cost_usd"),
+              },
+              "direction_b_arb_buy_sol_sell": {
+                  "arbitrum_usdt_bought_base_units": arb_buy["output_amount"],
+                  "arbitrum_usdt_bought_units": arb_buy["output_amount"] / 1_000_000,
+                  "solana_usdc_received_base_units": dir_b_out,
+                  "solana_usdc_received_units": dir_b_out / 1_000_000,
+                  "gross_cycle_delta_usdc_base_units": dir_b_profit,
+                  "gross_cycle_delta_usdc_units": dir_b_profit / 1_000_000,
+                  "gross_cycle_delta_bps": bps(dir_b_profit, NOTIONAL_USDC),
+                  "arbitrum_quote_gas_cost_usd": arb_buy.get("gas_cost_usd"),
+              },
+              "important_limit": (
+                  "Gross paired quote result only. It is not net arbitrage profit "
+                  "until network fees, rebalancing/inventory cost, execution "
+                  "slippage, and timing/finality risk are deducted."
+              ),
+              "evidence_hashes": {
+                  name: {
+                      "started_at_utc": rec["started_at_utc"],
+                      "completed_at_utc": rec["completed_at_utc"],
+                      "http_status": rec["http_status"],
+                      "request_sha256": rec["request_sha256"],
+                      "response_sha256": rec["response_sha256"],
+                  }
+                  for name, rec in records.items()
+              },
+              "safety": {
+                  "wallet": False,
+                  "private_key": False,
+                  "seed_phrase": False,
+                  "signer": False,
+                  "transaction_builder": False,
+                  "transaction_signing": False,
+                  "transaction_submission": False,
+                  "broadcast": False,
+                  "bridge_execution": False,
+                  "capital_movement": False,
+              },
+          }
+
+          (root / "evidence.json").write_text(
+              json.dumps(evidence, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          manifest = []
+          for path in sorted(root.iterdir()):
+              if path.is_file() and path.name != "manifest.sha256":
+                  manifest.append(
+                      f"{sha256(path.read_bytes())}  {path.name}"
+                  )
+          (root / "manifest.sha256").write_text(
+              "\n".join(manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "pair": evidence["pair"],
+              "solana_finalized_slot": evidence["chain_state"]["solana_finalized_slot"],
+              "arbitrum_block_number_hex": evidence["chain_state"]["arbitrum_block_number_hex"],
+              "direction_a_sol_buy_arb_sell": evidence["direction_a_sol_buy_arb_sell"],
+              "direction_b_arb_buy_sol_sell": evidence["direction_b_arb_buy_sol_sell"],
+              "execution_authority": False,
+          }, indent=2))
+          PY
+
+      - name: Upload paired evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosschain-paired-observation-${{ github.run_id }}
+          path: paired-evidence/
+          if-no-files-found: error
+          retention-days: 30
