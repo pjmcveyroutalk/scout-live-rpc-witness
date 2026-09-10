@@ -1,0 +1,39 @@
+name: Same-Pair Cross-Domain USDC-USDT Witness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  same-pair:
+    name: USDC-USDT Solana + Arbitrum read-only capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+      - name: Capture Solana 100 USDC to USDT quote
+        run: python3 same_pair_solana_usdc_usdt.py
+      - name: Capture Arbitrum 100 USDC to USDt0 quote
+        run: python3 same_pair_arbitrum_usdc_usdt.py
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf same-pair-cross-domain-evidence.tgz live-evidence
+          sha256sum same-pair-cross-domain-evidence.tgz > same-pair-cross-domain-evidence.tgz.sha256
+      - name: Upload same-pair evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: same-pair-cross-domain-usdc-usdt-${{ github.run_id }}
+          path: |
+            live-evidence/
+            same-pair-cross-domain-evidence.tgz
+            same-pair-cross-domain-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
