@@ -1,0 +1,458 @@
+name: Cross-Chain Temporal Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporal:
+    name: Solana-Arbitrum repeated live scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Observe repeated cross-chain snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import ssl
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode, urlparse
+
+          USDC_SOL="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          USDC_ARB="0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
+          ASSETS=[
+            {"symbol":"USDT","sol":"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB","arb":"0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9","sd":6,"ad":6},
+            {"symbol":"ETH","sol":"7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs","arb":"0x82af49447d8a07e3bd95bd0d56f35241523fbab1","sd":8,"ad":18},
+            {"symbol":"WBTC","sol":"3NZ9JMVBmGaG4Q8pf8WhTg8tQV7Ng8HmK8ZgYDBpqmJh","arb":"0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f","sd":8,"ad":8},
+          ]
+
+          NOTIONALS=[100,500]
+          SAMPLE_COUNT=12
+          SAMPLE_INTERVAL_SECONDS=30
+
+          RAY="transaction-v1.raydium.io"
+          PARA="api.paraswap.io"
+          SOL_RPC="https://api.mainnet-beta.solana.com"
+          ARB_RPC="https://arb1.arbitrum.io/rpc"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00","Z")
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def req(host, method, target, body=b"", ctype=None):
+              headers=[
+                  ("Host",host),
+                  ("User-Agent","Scout-XChain-Temporal/1.0.0"),
+                  ("Accept","application/json"),
+                  ("Accept-Encoding","identity"),
+                  ("Cache-Control","no-cache"),
+                  ("Connection","close"),
+              ]
+              if ctype:
+                  headers.append(("Content-Type",ctype))
+              if body:
+                  headers.append(("Content-Length",str(len(body))))
+
+              request_bytes=(
+                  f"{method} {target} HTTP/1.1\r\n"
+                  + "".join(f"{k}: {v}\r\n" for k,v in headers)
+                  + "\r\n"
+              ).encode()+body
+
+              started=now()
+              mono=time.monotonic_ns()
+              conn=http.client.HTTPSConnection(
+                  host,443,timeout=30,context=ssl.create_default_context()
+              )
+              try:
+                  conn.putrequest(
+                      method,target,skip_host=True,skip_accept_encoding=True
+                  )
+                  for k,v in headers:
+                      conn.putheader(k,v)
+                  conn.endheaders(body if body else None)
+                  resp=conn.getresponse()
+                  raw=resp.read()
+                  status=resp.status
+              finally:
+                  conn.close()
+
+              try:
+                  payload=json.loads(raw.decode())
+              except Exception:
+                  payload={"raw_utf8":raw.decode(errors="replace")}
+
+              return {
+                  "started_at_utc":started,
+                  "completed_at_utc":now(),
+                  "duration_ms":round(
+                      (time.monotonic_ns()-mono)/1_000_000,3
+                  ),
+                  "http_status":status,
+                  "request_bytes":request_bytes,
+                  "response_bytes":raw,
+                  "request_sha256":sha(request_bytes),
+                  "response_sha256":sha(raw),
+                  "json":payload,
+              }
+
+          def rpc(url,method,params,rid):
+              p=urlparse(url)
+              body=json.dumps(
+                  {"jsonrpc":"2.0","id":rid,"method":method,"params":params},
+                  separators=(",",":"),
+              ).encode()
+              return req(
+                  p.netloc,"POST",p.path or "/",body,"application/json"
+              )
+
+          def ray(src,dst,amt):
+              target="/compute/swap-base-in?"+urlencode([
+                  ("inputMint",src),
+                  ("outputMint",dst),
+                  ("amount",str(amt)),
+                  ("slippageBps","50"),
+                  ("txVersion","V0"),
+              ])
+              r=req(RAY,"GET",target)
+              d=r["json"].get("data") if isinstance(r["json"],dict) else None
+              r["ok"]=bool(
+                  r["http_status"]==200
+                  and isinstance(r["json"],dict)
+                  and r["json"].get("success") is True
+                  and isinstance(d,dict)
+                  and str(d.get("outputAmount","")).isdigit()
+              )
+              if r["ok"]:
+                  r["out"]=int(d["outputAmount"])
+              return r
+
+          def para(src,dst,amt,sd,dd):
+              target="/prices?"+urlencode([
+                  ("srcToken",src),
+                  ("destToken",dst),
+                  ("amount",str(amt)),
+                  ("srcDecimals",str(sd)),
+                  ("destDecimals",str(dd)),
+                  ("side","SELL"),
+                  ("network","42161"),
+              ])
+              r=req(PARA,"GET",target)
+              pr=(
+                  r["json"].get("priceRoute")
+                  if isinstance(r["json"],dict)
+                  else None
+              )
+              r["ok"]=bool(
+                  r["http_status"]==200
+                  and isinstance(pr,dict)
+                  and str(pr.get("destAmount","")).isdigit()
+              )
+              if r["ok"]:
+                  r["out"]=int(pr["destAmount"])
+                  r["gas_usd"]=pr.get("gasCostUSD")
+              return r
+
+          def convert(n,fd,td):
+              if td>=fd:
+                  return n*(10**(td-fd))
+              return n//(10**(fd-td))
+
+          def fgas(x):
+              try:
+                  return float(x)
+              except Exception:
+                  return None
+
+          root=Path("temporal-scan-evidence")
+          root.mkdir()
+          samples=[]
+          all_records={}
+          rid=1
+
+          def keep(name,r):
+              all_records[name]=r
+              (root/f"{name}_request.http").write_bytes(r["request_bytes"])
+              (root/f"{name}_response.body").write_bytes(
+                  r["response_bytes"]
+              )
+
+          for sample_idx in range(SAMPLE_COUNT):
+              sample_started=now()
+
+              sol_slot=rpc(
+                  SOL_RPC,"getSlot",[{"commitment":"finalized"}],rid
+              ); rid+=1
+              arb_block=rpc(
+                  ARB_RPC,"eth_blockNumber",[],rid
+              ); rid+=1
+              arb_gas=rpc(
+                  ARB_RPC,"eth_gasPrice",[],rid
+              ); rid+=1
+
+              keep(f"s{sample_idx:02d}_solana_getSlot",sol_slot)
+              keep(f"s{sample_idx:02d}_arbitrum_block",arb_block)
+              keep(f"s{sample_idx:02d}_arbitrum_gas",arb_gas)
+
+              ranked=[]
+
+              for a in ASSETS:
+                  for dollars in NOTIONALS:
+                      base=dollars*1_000_000
+                      tag=f"s{sample_idx:02d}_{a['symbol'].lower()}_{dollars}"
+
+                      sb=ray(USDC_SOL,a["sol"],base)
+                      keep(tag+"_a_sol_buy",sb)
+                      if sb["ok"]:
+                          aset=para(
+                              a["arb"],
+                              USDC_ARB,
+                              convert(sb["out"],a["sd"],a["ad"]),
+                              a["ad"],
+                              6,
+                          )
+                          keep(tag+"_a_arb_sell",aset)
+                          if aset["ok"]:
+                              delta=(aset["out"]-base)/1e6
+                              gas=fgas(aset.get("gas_usd"))
+                              gadj=None if gas is None else delta-gas
+                              ranked.append({
+                                  "asset":a["symbol"],
+                                  "notional_usdc":dollars,
+                                  "direction":"solana_to_arbitrum",
+                                  "gross_delta_usd":delta,
+                                  "gross_bps":delta*10000/dollars,
+                                  "arb_gas_usd":gas,
+                                  "gas_adjusted_usd":gadj,
+                                  "gas_adjusted_bps":(
+                                      None
+                                      if gadj is None
+                                      else gadj*10000/dollars
+                                  ),
+                                  "partial_positive":bool(
+                                      gadj is not None and gadj>0
+                                  ),
+                              })
+
+                      abuy=para(
+                          USDC_ARB,a["arb"],base,6,a["ad"]
+                      )
+                      keep(tag+"_b_arb_buy",abuy)
+                      if abuy["ok"]:
+                          ss=ray(
+                              a["sol"],
+                              USDC_SOL,
+                              convert(
+                                  abuy["out"],a["ad"],a["sd"]
+                              ),
+                          )
+                          keep(tag+"_b_sol_sell",ss)
+                          if ss["ok"]:
+                              delta=(ss["out"]-base)/1e6
+                              gas=fgas(abuy.get("gas_usd"))
+                              gadj=None if gas is None else delta-gas
+                              ranked.append({
+                                  "asset":a["symbol"],
+                                  "notional_usdc":dollars,
+                                  "direction":"arbitrum_to_solana",
+                                  "gross_delta_usd":delta,
+                                  "gross_bps":delta*10000/dollars,
+                                  "arb_gas_usd":gas,
+                                  "gas_adjusted_usd":gadj,
+                                  "gas_adjusted_bps":(
+                                      None
+                                      if gadj is None
+                                      else gadj*10000/dollars
+                                  ),
+                                  "partial_positive":bool(
+                                      gadj is not None and gadj>0
+                                  ),
+                              })
+
+              ranked.sort(
+                  key=lambda x: (
+                      -1e99
+                      if x["gas_adjusted_bps"] is None
+                      else x["gas_adjusted_bps"]
+                  ),
+                  reverse=True,
+              )
+
+              positives=[x for x in ranked if x["partial_positive"]]
+              best=ranked[0] if ranked else None
+
+              samples.append({
+                  "sample_index":sample_idx,
+                  "sample_started_at_utc":sample_started,
+                  "sample_completed_at_utc":now(),
+                  "solana_finalized_slot":sol_slot["json"].get("result"),
+                  "arbitrum_block_number_hex":arb_block["json"].get("result"),
+                  "arbitrum_gas_price_wei_hex":arb_gas["json"].get("result"),
+                  "candidate_count":len(positives),
+                  "best_candidate":best,
+                  "positive_candidates":positives,
+              })
+
+              print(json.dumps({
+                  "sample_index":sample_idx,
+                  "candidate_count":len(positives),
+                  "best_candidate":best,
+              }, separators=(",",":")))
+
+              if sample_idx < SAMPLE_COUNT-1:
+                  time.sleep(SAMPLE_INTERVAL_SECONDS)
+
+          # Aggregate persistence / lifetime.
+          key_stats={}
+          for sample in samples:
+              for candidate in sample["positive_candidates"]:
+                  key=(
+                      candidate["asset"],
+                      candidate["notional_usdc"],
+                      candidate["direction"],
+                  )
+                  k="|".join(map(str,key))
+                  s=key_stats.setdefault(k,{
+                      "asset":candidate["asset"],
+                      "notional_usdc":candidate["notional_usdc"],
+                      "direction":candidate["direction"],
+                      "positive_sample_count":0,
+                      "max_gas_adjusted_bps":None,
+                      "first_positive_sample":None,
+                      "last_positive_sample":None,
+                      "longest_consecutive_positive_samples":0,
+                      "_current_streak":0,
+                      "_last_sample_seen":None,
+                  })
+                  s["positive_sample_count"]+=1
+                  bps=candidate["gas_adjusted_bps"]
+                  if (
+                      s["max_gas_adjusted_bps"] is None
+                      or bps>s["max_gas_adjusted_bps"]
+                  ):
+                      s["max_gas_adjusted_bps"]=bps
+                  idx=sample["sample_index"]
+                  if s["first_positive_sample"] is None:
+                      s["first_positive_sample"]=idx
+                  s["last_positive_sample"]=idx
+                  if s["_last_sample_seen"]==idx-1:
+                      s["_current_streak"]+=1
+                  else:
+                      s["_current_streak"]=1
+                  s["_last_sample_seen"]=idx
+                  s["longest_consecutive_positive_samples"]=max(
+                      s["longest_consecutive_positive_samples"],
+                      s["_current_streak"],
+                  )
+
+          persistence=[]
+          for s in key_stats.values():
+              s.pop("_current_streak",None)
+              s.pop("_last_sample_seen",None)
+              s["approx_longest_duration_seconds"]=(
+                  max(
+                      0,
+                      (s["longest_consecutive_positive_samples"]-1)
+                      * SAMPLE_INTERVAL_SECONDS,
+                  )
+              )
+              persistence.append(s)
+
+          persistence.sort(
+              key=lambda x:(
+                  x["max_gas_adjusted_bps"],
+                  x["positive_sample_count"],
+              ),
+              reverse=True,
+          )
+
+          total_positive_samples=sum(
+              1 for s in samples if s["candidate_count"]>0
+          )
+          evidence={
+              "schema":"scout.crosschain_temporal_scan.v1",
+              "observation_only":True,
+              "execution_authority":False,
+              "sample_count":SAMPLE_COUNT,
+              "sample_interval_seconds":SAMPLE_INTERVAL_SECONDS,
+              "nominal_window_seconds":(
+                  (SAMPLE_COUNT-1)*SAMPLE_INTERVAL_SECONDS
+              ),
+              "assets":[a["symbol"] for a in ASSETS],
+              "notionals_usdc":NOTIONALS,
+              "samples":samples,
+              "positive_sample_count":total_positive_samples,
+              "persistence":persistence,
+              "important_limit":(
+                  "Partial cost screen only. Arbitrum quoted gas is deducted, "
+                  "but Solana fees, realized slippage, inventory/rebalancing, "
+                  "representation/basis risk, and timing/finality execution risk "
+                  "remain unpriced. Positive observations are research signals "
+                  "only and confer no execution authority."
+              ),
+              "evidence_hashes":{
+                  n:{
+                      "started_at_utc":r["started_at_utc"],
+                      "completed_at_utc":r["completed_at_utc"],
+                      "http_status":r["http_status"],
+                      "request_sha256":r["request_sha256"],
+                      "response_sha256":r["response_sha256"],
+                  }
+                  for n,r in all_records.items()
+              },
+              "safety":{
+                  "wallet":False,
+                  "private_key":False,
+                  "seed_phrase":False,
+                  "signer":False,
+                  "transaction_builder":False,
+                  "transaction_signing":False,
+                  "transaction_submission":False,
+                  "broadcast":False,
+                  "bridge_execution":False,
+                  "capital_movement":False,
+              },
+          }
+
+          (root/"evidence.json").write_text(
+              json.dumps(evidence,sort_keys=True,indent=2)+"\n"
+          )
+
+          manifest=[]
+          for p in sorted(root.iterdir()):
+              if p.is_file() and p.name!="manifest.sha256":
+                  manifest.append(
+                      f"{sha(p.read_bytes())}  {p.name}"
+                  )
+          (root/"manifest.sha256").write_text(
+              "\n".join(manifest)+"\n"
+          )
+
+          print(json.dumps({
+              "positive_sample_count":total_positive_samples,
+              "persistence":persistence,
+              "execution_authority":False,
+          }, indent=2))
+          PY
+
+      - name: Upload temporal evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosschain-temporal-scan-${{ github.run_id }}
+          path: temporal-scan-evidence/
+          if-no-files-found: error
+          retention-days: 30
