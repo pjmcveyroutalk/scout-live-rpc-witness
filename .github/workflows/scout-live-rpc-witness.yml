@@ -1,0 +1,30 @@
+name: Scout LIVE RPC Witness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-rpc-witness:
+    name: LIVE-1 + LIVE-2 read-only RPC witness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run read-only RPC witness
+        run: |
+          python3 scout_live_rpc_witness.py both --output live-evidence
+
+      - name: Upload raw evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-live-rpc-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: live-evidence/scout_live_rpc_evidence_*/
+          if-no-files-found: warn
+          retention-days: 7
