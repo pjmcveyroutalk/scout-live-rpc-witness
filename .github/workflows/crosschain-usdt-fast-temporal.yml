@@ -1,0 +1,428 @@
+name: Cross-Chain USDT Fast Temporal Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fast-watch:
+    name: Arbitrum-to-Solana USDT fast temporal watch
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Observe USDT $100 route every 5 seconds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import ssl
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode, urlparse
+
+          USDC_SOL="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          USDT_SOL="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+          USDC_ARB="0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+          USDT_ARB="0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+
+          NOTIONAL_USDC=100
+          BASE_USDC=100_000_000
+
+          SAMPLE_COUNT=48
+          SAMPLE_INTERVAL_SECONDS=5
+
+          PARA_HOST="api.paraswap.io"
+          RAY_HOST="transaction-v1.raydium.io"
+          SOL_RPC="https://api.mainnet-beta.solana.com"
+          ARB_RPC="https://arb1.arbitrum.io/rpc"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00","Z")
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def request(host, method, target, body=b"", content_type=None):
+              headers=[
+                  ("Host",host),
+                  ("User-Agent","Scout-USDT-Fast-Temporal/1.0.0"),
+                  ("Accept","application/json"),
+                  ("Accept-Encoding","identity"),
+                  ("Cache-Control","no-cache"),
+                  ("Connection","close"),
+              ]
+              if content_type:
+                  headers.append(("Content-Type",content_type))
+              if body:
+                  headers.append(("Content-Length",str(len(body))))
+
+              request_bytes=(
+                  f"{method} {target} HTTP/1.1\r\n"
+                  + "".join(f"{k}: {v}\r\n" for k,v in headers)
+                  + "\r\n"
+              ).encode()+body
+
+              started=now()
+              mono=time.monotonic_ns()
+              conn=http.client.HTTPSConnection(
+                  host,443,timeout=20,context=ssl.create_default_context()
+              )
+              try:
+                  conn.putrequest(
+                      method,target,skip_host=True,skip_accept_encoding=True
+                  )
+                  for k,v in headers:
+                      conn.putheader(k,v)
+                  conn.endheaders(body if body else None)
+                  resp=conn.getresponse()
+                  raw=resp.read()
+                  status=resp.status
+              finally:
+                  conn.close()
+
+              try:
+                  payload=json.loads(raw.decode())
+              except Exception:
+                  payload={"raw_utf8":raw.decode(errors="replace")}
+
+              return {
+                  "started_at_utc":started,
+                  "completed_at_utc":now(),
+                  "duration_ms":round(
+                      (time.monotonic_ns()-mono)/1_000_000,3
+                  ),
+                  "http_status":status,
+                  "request_bytes":request_bytes,
+                  "response_bytes":raw,
+                  "request_sha256":sha(request_bytes),
+                  "response_sha256":sha(raw),
+                  "json":payload,
+              }
+
+          def rpc(endpoint, method, params, rid):
+              p=urlparse(endpoint)
+              body=json.dumps(
+                  {
+                      "jsonrpc":"2.0",
+                      "id":rid,
+                      "method":method,
+                      "params":params,
+                  },
+                  separators=(",",":"),
+              ).encode()
+              return request(
+                  p.netloc,
+                  "POST",
+                  p.path or "/",
+                  body,
+                  "application/json",
+              )
+
+          def paraswap_buy_usdt():
+              target="/prices?"+urlencode([
+                  ("srcToken",USDC_ARB),
+                  ("destToken",USDT_ARB),
+                  ("amount",str(BASE_USDC)),
+                  ("srcDecimals","6"),
+                  ("destDecimals","6"),
+                  ("side","SELL"),
+                  ("network","42161"),
+              ])
+              r=request(PARA_HOST,"GET",target)
+              pr=(
+                  r["json"].get("priceRoute")
+                  if isinstance(r["json"],dict)
+                  else None
+              )
+              r["ok"]=bool(
+                  r["http_status"]==200
+                  and isinstance(pr,dict)
+                  and str(pr.get("destAmount","")).isdigit()
+              )
+              if r["ok"]:
+                  r["out"]=int(pr["destAmount"])
+                  r["gas_usd"]=pr.get("gasCostUSD")
+              return r
+
+          def raydium_sell_usdt(amount):
+              target="/compute/swap-base-in?"+urlencode([
+                  ("inputMint",USDT_SOL),
+                  ("outputMint",USDC_SOL),
+                  ("amount",str(amount)),
+                  ("slippageBps","50"),
+                  ("txVersion","V0"),
+              ])
+              r=request(RAY_HOST,"GET",target)
+              d=r["json"].get("data") if isinstance(r["json"],dict) else None
+              r["ok"]=bool(
+                  r["http_status"]==200
+                  and isinstance(r["json"],dict)
+                  and r["json"].get("success") is True
+                  and isinstance(d,dict)
+                  and str(d.get("outputAmount","")).isdigit()
+              )
+              if r["ok"]:
+                  r["out"]=int(d["outputAmount"])
+              return r
+
+          def float_or_none(x):
+              try:
+                  return float(x)
+              except Exception:
+                  return None
+
+          root=Path("usdt-fast-temporal-evidence")
+          root.mkdir()
+          records={}
+          samples=[]
+          rid=1
+
+          def keep(name, rec):
+              records[name]=rec
+              (root/f"{name}_request.http").write_bytes(
+                  rec["request_bytes"]
+              )
+              (root/f"{name}_response.body").write_bytes(
+                  rec["response_bytes"]
+              )
+
+          for i in range(SAMPLE_COUNT):
+              sample_started=now()
+
+              sol_slot=rpc(
+                  SOL_RPC,
+                  "getSlot",
+                  [{"commitment":"finalized"}],
+                  rid,
+              )
+              rid+=1
+              arb_block=rpc(
+                  ARB_RPC,
+                  "eth_blockNumber",
+                  [],
+                  rid,
+              )
+              rid+=1
+              arb_gas=rpc(
+                  ARB_RPC,
+                  "eth_gasPrice",
+                  [],
+                  rid,
+              )
+              rid+=1
+
+              keep(f"s{i:02d}_solana_slot",sol_slot)
+              keep(f"s{i:02d}_arbitrum_block",arb_block)
+              keep(f"s{i:02d}_arbitrum_gas",arb_gas)
+
+              arb_buy=paraswap_buy_usdt()
+              keep(f"s{i:02d}_arb_buy_usdt",arb_buy)
+
+              result={
+                  "sample_index":i,
+                  "sample_started_at_utc":sample_started,
+                  "solana_finalized_slot":sol_slot["json"].get("result"),
+                  "arbitrum_block_number_hex":arb_block["json"].get("result"),
+                  "arbitrum_gas_price_wei_hex":arb_gas["json"].get("result"),
+                  "status":"arbitrum_quote_failed",
+                  "partial_positive":False,
+              }
+
+              if arb_buy["ok"]:
+                  usdt_amount=arb_buy["out"]
+                  sol_sell=raydium_sell_usdt(usdt_amount)
+                  keep(f"s{i:02d}_sol_sell_usdt",sol_sell)
+
+                  if sol_sell["ok"]:
+                      usdc_out=sol_sell["out"]
+                      gross_delta_usd=(usdc_out-BASE_USDC)/1_000_000
+                      gross_bps=(
+                          gross_delta_usd*10000/NOTIONAL_USDC
+                      )
+                      gas_usd=float_or_none(
+                          arb_buy.get("gas_usd")
+                      )
+                      gas_adjusted_usd=(
+                          None
+                          if gas_usd is None
+                          else gross_delta_usd-gas_usd
+                      )
+                      gas_adjusted_bps=(
+                          None
+                          if gas_adjusted_usd is None
+                          else gas_adjusted_usd*10000/NOTIONAL_USDC
+                      )
+
+                      result.update({
+                          "status":"quoted",
+                          "arbitrum_usdt_bought_units":(
+                              usdt_amount/1_000_000
+                          ),
+                          "solana_usdc_out":(
+                              usdc_out/1_000_000
+                          ),
+                          "gross_delta_usd":gross_delta_usd,
+                          "gross_delta_bps":gross_bps,
+                          "arbitrum_quote_gas_cost_usd":gas_usd,
+                          "gas_adjusted_delta_usd":gas_adjusted_usd,
+                          "gas_adjusted_delta_bps":gas_adjusted_bps,
+                          "partial_positive":bool(
+                              gas_adjusted_usd is not None
+                              and gas_adjusted_usd>0
+                          ),
+                      })
+                  else:
+                      result["status"]="solana_quote_failed"
+
+              result["sample_completed_at_utc"]=now()
+              samples.append(result)
+
+              print(json.dumps(result,separators=(",",":")))
+
+              if i < SAMPLE_COUNT-1:
+                  time.sleep(SAMPLE_INTERVAL_SECONDS)
+
+          # Persistence analysis.
+          positive_indices=[
+              s["sample_index"]
+              for s in samples
+              if s.get("partial_positive") is True
+          ]
+
+          streaks=[]
+          current=[]
+          for idx in positive_indices:
+              if not current or idx==current[-1]+1:
+                  current.append(idx)
+              else:
+                  streaks.append(current)
+                  current=[idx]
+          if current:
+              streaks.append(current)
+
+          longest=max(streaks,key=len) if streaks else []
+
+          positive_samples=[
+              s for s in samples if s.get("partial_positive") is True
+          ]
+
+          max_positive=(
+              max(
+                  positive_samples,
+                  key=lambda s:s["gas_adjusted_delta_bps"]
+              )
+              if positive_samples
+              else None
+          )
+
+          evidence={
+              "schema":"scout.crosschain_usdt_fast_temporal.v1",
+              "observation_only":True,
+              "execution_authority":False,
+              "route":"USDC(Arbitrum)->USDT(Arbitrum) / USDT(Solana)->USDC(Solana)",
+              "notional_usdc":NOTIONAL_USDC,
+              "sample_count":SAMPLE_COUNT,
+              "sample_interval_seconds":SAMPLE_INTERVAL_SECONDS,
+              "nominal_window_seconds":(
+                  (SAMPLE_COUNT-1)*SAMPLE_INTERVAL_SECONDS
+              ),
+              "positive_sample_count":len(positive_samples),
+              "positive_sample_indices":positive_indices,
+              "positive_fraction":(
+                  len(positive_samples)/SAMPLE_COUNT
+              ),
+              "longest_consecutive_positive_samples":len(longest),
+              "longest_positive_streak_indices":longest,
+              "approx_longest_positive_duration_seconds":(
+                  0
+                  if not longest
+                  else max(
+                      0,
+                      (len(longest)-1)*SAMPLE_INTERVAL_SECONDS,
+                  )
+              ),
+              "max_positive_sample":max_positive,
+              "samples":samples,
+              "important_limit":(
+                  "Partial cost screen only. Arbitrum quoted gas is deducted. "
+                  "Solana execution fee/priority fee, realized slippage, "
+                  "inventory/rebalancing cost, execution latency, timing/finality "
+                  "risk, and any venue-specific execution effects remain unpriced. "
+                  "Positive observations are research signals only."
+              ),
+              "evidence_hashes":{
+                  name:{
+                      "started_at_utc":rec["started_at_utc"],
+                      "completed_at_utc":rec["completed_at_utc"],
+                      "http_status":rec["http_status"],
+                      "request_sha256":rec["request_sha256"],
+                      "response_sha256":rec["response_sha256"],
+                  }
+                  for name,rec in records.items()
+              },
+              "safety":{
+                  "wallet":False,
+                  "private_key":False,
+                  "seed_phrase":False,
+                  "signer":False,
+                  "transaction_builder":False,
+                  "transaction_signing":False,
+                  "transaction_submission":False,
+                  "broadcast":False,
+                  "bridge_execution":False,
+                  "capital_movement":False,
+              },
+          }
+
+          (root/"evidence.json").write_text(
+              json.dumps(evidence,sort_keys=True,indent=2)+"\n",
+              encoding="utf-8",
+          )
+
+          manifest=[]
+          for p in sorted(root.iterdir()):
+              if p.is_file() and p.name!="manifest.sha256":
+                  manifest.append(
+                      f"{sha(p.read_bytes())}  {p.name}"
+                  )
+          (root/"manifest.sha256").write_text(
+              "\n".join(manifest)+"\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "positive_sample_count":evidence[
+                  "positive_sample_count"
+              ],
+              "positive_fraction":evidence[
+                  "positive_fraction"
+              ],
+              "longest_consecutive_positive_samples":evidence[
+                  "longest_consecutive_positive_samples"
+              ],
+              "approx_longest_positive_duration_seconds":evidence[
+                  "approx_longest_positive_duration_seconds"
+              ],
+              "max_positive_sample":evidence[
+                  "max_positive_sample"
+              ],
+              "execution_authority":False,
+          },indent=2))
+          PY
+
+      - name: Upload fast temporal evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosschain-usdt-fast-temporal-${{ github.run_id }}
+          path: usdt-fast-temporal-evidence/
+          if-no-files-found: error
+          retention-days: 30
