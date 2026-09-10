@@ -1,0 +1,39 @@
+name: Arbitrum Live Economic Quote Witness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evm-quote-1:
+    name: EVM-QUOTE-1 read-only capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+      - name: Show Python runtime
+        run: python3 --version
+      - name: Capture genuine Arbitrum WETH-USDC price quote
+        run: python3 arbitrum_quote_witness.py capture --output live-evidence
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf arbitrum-live-quote-evidence.tgz live-evidence
+          sha256sum arbitrum-live-quote-evidence.tgz > arbitrum-live-quote-evidence.tgz.sha256
+      - name: Upload EVM-QUOTE-1 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arbitrum-live-quote-evidence-${{ github.run_id }}
+          path: |
+            live-evidence/
+            arbitrum-live-quote-evidence.tgz
+            arbitrum-live-quote-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
