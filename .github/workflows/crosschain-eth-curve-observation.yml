@@ -1,0 +1,369 @@
+name: Cross-Chain ETH Curve Observation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Solana-Arbitrum ETH paired curve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Capture ETH paired curve evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import ssl
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode, urlparse
+
+          SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          SOL_WETH = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
+          ARB_USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+          ARB_WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+
+          USDC_DECIMALS = 6
+          SOL_WETH_DECIMALS = 8
+          ARB_WETH_DECIMALS = 18
+          WETH_SCALE = 10 ** (ARB_WETH_DECIMALS - SOL_WETH_DECIMALS)
+
+          NOTIONALS_USDC = [10, 100, 500, 1000]
+
+          RAYDIUM_HOST = "transaction-v1.raydium.io"
+          PARA_HOST = "api.paraswap.io"
+          SOL_RPC = "https://api.mainnet-beta.solana.com"
+          ARB_RPC = "https://arb1.arbitrum.io/rpc"
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00", "Z")
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def request(host, method, target, body=None, content_type=None):
+              body = body or b""
+              headers = [
+                  ("Host", host),
+                  ("User-Agent", "Scout-CrossChain-ETH-Curve/1.0.0"),
+                  ("Accept", "application/json"),
+                  ("Accept-Encoding", "identity"),
+                  ("Cache-Control", "no-cache"),
+                  ("Connection", "close"),
+              ]
+              if content_type:
+                  headers.append(("Content-Type", content_type))
+              if body:
+                  headers.append(("Content-Length", str(len(body))))
+
+              request_bytes = (
+                  f"{method} {target} HTTP/1.1\r\n"
+                  + "".join(f"{k}: {v}\r\n" for k, v in headers)
+                  + "\r\n"
+              ).encode("ascii") + body
+
+              started = now()
+              mono = time.monotonic_ns()
+              conn = http.client.HTTPSConnection(
+                  host, 443, timeout=30, context=ssl.create_default_context()
+              )
+              try:
+                  conn.putrequest(
+                      method, target, skip_host=True, skip_accept_encoding=True
+                  )
+                  for key, value in headers:
+                      conn.putheader(key, value)
+                  conn.endheaders(body if body else None)
+                  response = conn.getresponse()
+                  raw = response.read()
+                  status = response.status
+              finally:
+                  conn.close()
+
+              try:
+                  parsed_json = json.loads(raw.decode("utf-8"))
+              except Exception:
+                  parsed_json = {"raw_utf8": raw.decode("utf-8", errors="replace")}
+
+              return {
+                  "started_at_utc": started,
+                  "completed_at_utc": now(),
+                  "duration_ms": round(
+                      (time.monotonic_ns() - mono) / 1_000_000, 3
+                  ),
+                  "http_status": status,
+                  "request_bytes": request_bytes,
+                  "response_bytes": raw,
+                  "request_sha256": sha256(request_bytes),
+                  "response_sha256": sha256(raw),
+                  "json": parsed_json,
+              }
+
+          def rpc(endpoint, method, params, request_id):
+              parsed = urlparse(endpoint)
+              body = json.dumps(
+                  {
+                      "jsonrpc": "2.0",
+                      "id": request_id,
+                      "method": method,
+                      "params": params,
+                  },
+                  separators=(",", ":"),
+              ).encode("utf-8")
+              result = request(
+                  parsed.netloc,
+                  "POST",
+                  parsed.path or "/",
+                  body,
+                  "application/json",
+              )
+              if result["http_status"] != 200 or "error" in result["json"]:
+                  raise SystemExit(f"{method} failed: {result['json']}")
+              return result
+
+          def raydium_quote(src, dst, amount):
+              target = "/compute/swap-base-in?" + urlencode([
+                  ("inputMint", src),
+                  ("outputMint", dst),
+                  ("amount", str(amount)),
+                  ("slippageBps", "50"),
+                  ("txVersion", "V0"),
+              ])
+              result = request(RAYDIUM_HOST, "GET", target)
+              data = (
+                  result["json"].get("data")
+                  if isinstance(result["json"], dict)
+                  else None
+              )
+              if not (
+                  result["http_status"] == 200
+                  and isinstance(result["json"], dict)
+                  and result["json"].get("success") is True
+                  and isinstance(data, dict)
+                  and str(data.get("outputAmount", "")).isdigit()
+              ):
+                  raise SystemExit(f"Raydium quote failed: {result['json']}")
+              result["output_amount"] = int(data["outputAmount"])
+              return result
+
+          def paraswap_quote(
+              src, dst, amount, src_decimals, dst_decimals
+          ):
+              target = "/prices?" + urlencode([
+                  ("srcToken", src),
+                  ("destToken", dst),
+                  ("amount", str(amount)),
+                  ("srcDecimals", str(src_decimals)),
+                  ("destDecimals", str(dst_decimals)),
+                  ("side", "SELL"),
+                  ("network", "42161"),
+              ])
+              result = request(PARA_HOST, "GET", target)
+              route = (
+                  result["json"].get("priceRoute")
+                  if isinstance(result["json"], dict)
+                  else None
+              )
+              if not (
+                  result["http_status"] == 200
+                  and isinstance(route, dict)
+                  and str(route.get("destAmount", "")).isdigit()
+              ):
+                  raise SystemExit(f"Arbitrum quote failed: {result['json']}")
+              result["output_amount"] = int(route["destAmount"])
+              result["gas_cost_usd"] = route.get("gasCostUSD")
+              return result
+
+          def bps(delta, base):
+              return delta * 10000.0 / base
+
+          root = Path("eth-curve-evidence")
+          root.mkdir()
+
+          records = {}
+
+          def keep(name, rec):
+              records[name] = rec
+              (root / f"{name}_request.http").write_bytes(rec["request_bytes"])
+              (root / f"{name}_response.body").write_bytes(
+                  rec["response_bytes"]
+              )
+
+          sol_slot = rpc(
+              SOL_RPC, "getSlot", [{"commitment": "finalized"}], 1
+          )
+          arb_block = rpc(ARB_RPC, "eth_blockNumber", [], 2)
+          arb_gas = rpc(ARB_RPC, "eth_gasPrice", [], 3)
+          keep("solana_getSlot", sol_slot)
+          keep("arbitrum_eth_blockNumber", arb_block)
+          keep("arbitrum_eth_gasPrice", arb_gas)
+
+          rows = []
+
+          for dollars in NOTIONALS_USDC:
+              base = dollars * 10 ** USDC_DECIMALS
+              tag = str(dollars)
+
+              # A: USDC -> Wormhole ETH on Solana; sell economically
+              # equivalent amount of WETH on Arbitrum -> USDC.
+              sol_buy = raydium_quote(SOL_USDC, SOL_WETH, base)
+              arb_weth_same = sol_buy["output_amount"] * WETH_SCALE
+              arb_sell = paraswap_quote(
+                  ARB_WETH,
+                  ARB_USDC,
+                  arb_weth_same,
+                  ARB_WETH_DECIMALS,
+                  USDC_DECIMALS,
+              )
+              keep(f"n{tag}_sol_buy_weth", sol_buy)
+              keep(f"n{tag}_arb_sell_same_weth", arb_sell)
+
+              # B: USDC -> WETH on Arbitrum; sell economically equivalent
+              # amount of Wormhole ETH on Solana -> USDC.
+              arb_buy = paraswap_quote(
+                  ARB_USDC,
+                  ARB_WETH,
+                  base,
+                  USDC_DECIMALS,
+                  ARB_WETH_DECIMALS,
+              )
+              sol_weth_same = arb_buy["output_amount"] // WETH_SCALE
+              sol_sell = raydium_quote(
+                  SOL_WETH, SOL_USDC, sol_weth_same
+              )
+              keep(f"n{tag}_arb_buy_weth", arb_buy)
+              keep(f"n{tag}_sol_sell_same_weth", sol_sell)
+
+              a_out = arb_sell["output_amount"]
+              b_out = sol_sell["output_amount"]
+              a_delta = a_out - base
+              b_delta = b_out - base
+
+              rows.append({
+                  "notional_usdc": dollars,
+                  "direction_a_sol_buy_arb_sell": {
+                      "solana_weth_units": (
+                          sol_buy["output_amount"] / 10 ** SOL_WETH_DECIMALS
+                      ),
+                      "arbitrum_usdc_out": a_out / 10 ** USDC_DECIMALS,
+                      "gross_delta_usdc": a_delta / 10 ** USDC_DECIMALS,
+                      "gross_delta_bps": bps(a_delta, base),
+                      "arbitrum_quote_gas_cost_usd": (
+                          arb_sell.get("gas_cost_usd")
+                      ),
+                  },
+                  "direction_b_arb_buy_sol_sell": {
+                      "arbitrum_weth_units": (
+                          arb_buy["output_amount"] / 10 ** ARB_WETH_DECIMALS
+                      ),
+                      "solana_usdc_out": b_out / 10 ** USDC_DECIMALS,
+                      "gross_delta_usdc": b_delta / 10 ** USDC_DECIMALS,
+                      "gross_delta_bps": bps(b_delta, base),
+                      "arbitrum_quote_gas_cost_usd": (
+                          arb_buy.get("gas_cost_usd")
+                      ),
+                  },
+              })
+
+          evidence = {
+              "schema": "scout.crosschain_eth_curve_observation.v1",
+              "observation_only": True,
+              "execution_authority": False,
+              "chains": ["solana-mainnet", "arbitrum-one"],
+              "economic_asset": "ETH",
+              "solana_asset": {
+                  "name": "Wrapped Ether (Wormhole)",
+                  "mint": SOL_WETH,
+                  "decimals": SOL_WETH_DECIMALS,
+              },
+              "arbitrum_asset": {
+                  "name": "WETH",
+                  "contract": ARB_WETH,
+                  "decimals": ARB_WETH_DECIMALS,
+              },
+              "quote_currency": "USDC",
+              "notionals_usdc": NOTIONALS_USDC,
+              "chain_state": {
+                  "solana_finalized_slot": sol_slot["json"].get("result"),
+                  "arbitrum_block_number_hex": arb_block["json"].get("result"),
+                  "arbitrum_gas_price_wei_hex": arb_gas["json"].get("result"),
+              },
+              "curve": rows,
+              "important_limit": (
+                  "Read-only paired quote observation. Gross cycle deltas are "
+                  "not executable net profit. Deduct both-chain execution costs, "
+                  "actual slippage, inventory/rebalancing cost, representation/"
+                  "bridge basis risk, and timing/finality risk before any live "
+                  "capital test."
+              ),
+              "evidence_hashes": {
+                  name: {
+                      "started_at_utc": rec["started_at_utc"],
+                      "completed_at_utc": rec["completed_at_utc"],
+                      "http_status": rec["http_status"],
+                      "request_sha256": rec["request_sha256"],
+                      "response_sha256": rec["response_sha256"],
+                  }
+                  for name, rec in records.items()
+              },
+              "safety": {
+                  "wallet": False,
+                  "private_key": False,
+                  "seed_phrase": False,
+                  "signer": False,
+                  "transaction_builder": False,
+                  "transaction_signing": False,
+                  "transaction_submission": False,
+                  "broadcast": False,
+                  "bridge_execution": False,
+                  "capital_movement": False,
+              },
+          }
+
+          (root / "evidence.json").write_text(
+              json.dumps(evidence, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          manifest = []
+          for path in sorted(root.iterdir()):
+              if path.is_file() and path.name != "manifest.sha256":
+                  manifest.append(
+                      f"{sha256(path.read_bytes())}  {path.name}"
+                  )
+          (root / "manifest.sha256").write_text(
+              "\n".join(manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "economic_asset": "ETH",
+              "solana_finalized_slot": evidence["chain_state"][
+                  "solana_finalized_slot"
+              ],
+              "arbitrum_block_number_hex": evidence["chain_state"][
+                  "arbitrum_block_number_hex"
+              ],
+              "curve": rows,
+              "execution_authority": False,
+          }, indent=2))
+          PY
+
+      - name: Upload ETH curve evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosschain-eth-curve-${{ github.run_id }}
+          path: eth-curve-evidence/
+          if-no-files-found: error
+          retention-days: 30
