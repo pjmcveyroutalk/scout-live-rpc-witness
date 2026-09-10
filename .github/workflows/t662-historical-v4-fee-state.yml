@@ -1,0 +1,45 @@
+name: T662 Historical Uniswap v4 Fee State Witness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  t662-historical-v4-fee-state:
+    name: T662 replay-block getSlot0 capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Capture historical Uniswap v4 fee state
+        run: python3 uniswap_v4_fee_state_replay_block_witness.py
+
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf t662-historical-v4-fee-state-evidence.tgz live-evidence
+          sha256sum t662-historical-v4-fee-state-evidence.tgz \
+            > t662-historical-v4-fee-state-evidence.tgz.sha256
+
+      - name: Upload T662 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t662-historical-v4-fee-state-${{ github.run_id }}
+          path: |
+            live-evidence/
+            t662-historical-v4-fee-state-evidence.tgz
+            t662-historical-v4-fee-state-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
