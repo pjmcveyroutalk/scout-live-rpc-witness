@@ -1,0 +1,39 @@
+name: Cross-Domain USDC-USDT Size Curve
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  size-curve:
+    name: 100-500-1000 USDC read-only size curve
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+      - name: Capture Solana size curve
+        run: python3 size_curve_solana_usdc_usdt.py
+      - name: Capture Arbitrum size curve
+        run: python3 size_curve_arbitrum_usdc_usdt.py
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf cross-domain-size-curve-evidence.tgz live-evidence
+          sha256sum cross-domain-size-curve-evidence.tgz > cross-domain-size-curve-evidence.tgz.sha256
+      - name: Upload size-curve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-domain-usdc-usdt-size-curve-${{ github.run_id }}
+          path: |
+            live-evidence/
+            cross-domain-size-curve-evidence.tgz
+            cross-domain-size-curve-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
