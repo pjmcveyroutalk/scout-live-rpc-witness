@@ -1,0 +1,30 @@
+name: Scout LIVE RPC Quorum
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-rpc-quorum:
+    name: Solana + Arbitrum independent RPC quorum
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run independent RPC quorum witness
+        run: |
+          python3 scout_live_rpc_quorum_witness.py both --output quorum-evidence
+
+      - name: Upload quorum evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-live-rpc-quorum-${{ github.run_id }}-${{ github.run_attempt }}
+          path: quorum-evidence/scout_live_rpc_quorum_*/
+          if-no-files-found: warn
+          retention-days: 7
