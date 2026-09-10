@@ -1,0 +1,45 @@
+name: T672 Arbitrum $500 Volatility Replay
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  t672-arbitrum-500-replay:
+    name: T672 read-only 20x $500 quote replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Capture 20 consecutive $500 Arbitrum quotes
+        run: python3 arbitrum_500_volatility_replay.py
+
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf t672-arbitrum-500-volatility-replay-evidence.tgz live-evidence
+          sha256sum t672-arbitrum-500-volatility-replay-evidence.tgz \
+            > t672-arbitrum-500-volatility-replay-evidence.tgz.sha256
+
+      - name: Upload T672 evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t672-arbitrum-500-volatility-replay-${{ github.run_id }}
+          path: |
+            live-evidence/
+            t672-arbitrum-500-volatility-replay-evidence.tgz
+            t672-arbitrum-500-volatility-replay-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
