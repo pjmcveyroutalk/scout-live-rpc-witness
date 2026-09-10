@@ -1,0 +1,130 @@
+name: Scout Lab Harness
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "t[0-9][0-9][0-9]_*.py"
+  workflow_dispatch:
+    inputs:
+      test_file:
+        description: "Repo-root witness file, e.g. t673_robust_reserve.py"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scout-lab:
+    name: Permanent read-only Scout Lab runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Select test files
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_TEST_FILE: ${{ inputs.test_file }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            test_file="$MANUAL_TEST_FILE"
+            if [[ ! "$test_file" =~ ^t[0-9]{3}_[A-Za-z0-9_.-]+\.py$ ]]; then
+              echo "Invalid test filename: $test_file" >&2
+              exit 1
+            fi
+            if [[ ! -f "$test_file" ]]; then
+              echo "Test file not found: $test_file" >&2
+              exit 1
+            fi
+            printf '%s\n' "$test_file" > selected-tests.txt
+          else
+            base="$BEFORE_SHA"
+            if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+              base="$(git rev-parse HEAD^)"
+            fi
+
+            git diff --name-only --diff-filter=AM "$base" "$CURRENT_SHA" \
+              | grep -E '^t[0-9]{3}_[A-Za-z0-9_.-]+\.py$' \
+              | sort -u \
+              > selected-tests.txt || true
+
+            if [[ ! -s selected-tests.txt ]]; then
+              echo "No eligible Scout Lab witness changed in this push." >&2
+              exit 1
+            fi
+          fi
+
+          echo "Selected tests:"
+          cat selected-tests.txt
+
+      - name: Run selected witnesses through permanent harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < selected-tests.txt
+          python3 scout_lab_runner.py "${tests[@]}"
+
+      - name: Build GitHub Actions summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Scout Lab Harness"
+            echo
+            echo "- Execution authority: **false**"
+            echo "- Selected tests:"
+            if [[ -f selected-tests.txt ]]; then
+              sed 's/^/  - `/' selected-tests.txt | sed 's/$/`/'
+            else
+              echo "  - selection failed"
+            fi
+            echo
+            echo "Evidence and harness summaries are attached as the run artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p lab-artifact
+          if [[ -d live-evidence ]]; then
+            cp -a live-evidence lab-artifact/
+          fi
+          if [[ -d lab-run-summaries ]]; then
+            cp -a lab-run-summaries lab-artifact/
+          fi
+          if [[ -f selected-tests.txt ]]; then
+            cp selected-tests.txt lab-artifact/
+          fi
+          tar -czf scout-lab-evidence.tgz lab-artifact
+          sha256sum scout-lab-evidence.tgz > scout-lab-evidence.tgz.sha256
+
+      - name: Upload Scout Lab evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-lab-${{ github.run_id }}
+          path: |
+            lab-artifact/
+            scout-lab-evidence.tgz
+            scout-lab-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
