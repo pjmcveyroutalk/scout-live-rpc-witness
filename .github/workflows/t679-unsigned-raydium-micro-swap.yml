@@ -188,25 +188,53 @@ jobs:
 
           built = json.loads(build_raw.decode("utf-8"))
           built_data = built.get("data") if isinstance(built, dict) else None
-          tx_b64 = (
-              built_data.get("transaction")
-              if isinstance(built_data, dict)
-              else None
-          )
+
+          tx_entries = []
+          if isinstance(built_data, list):
+              tx_entries = [
+                  item for item in built_data
+                  if isinstance(item, dict)
+                  and isinstance(item.get("transaction"), str)
+                  and item["transaction"]
+              ]
+          elif isinstance(built_data, dict):
+              # Backward-compatible with single-object response shapes.
+              if isinstance(built_data.get("transaction"), str) and built_data["transaction"]:
+                  tx_entries = [built_data]
+
           build_ok = (
               build_status == 200
               and isinstance(built, dict)
               and built.get("success") is True
-              and isinstance(tx_b64, str)
-              and len(tx_b64) > 0
+              and len(tx_entries) > 0
           )
           if not build_ok:
-              raise SystemExit("Raydium unsigned transaction build failed")
+              error_summary = {
+                  "http_status": build_status,
+                  "response": built if isinstance(built, dict) else None,
+              }
+              write_json(out / "build_error.json", error_summary)
+              raise SystemExit(
+                  "Raydium unsigned transaction build failed; "
+                  "see build_error.json"
+              )
 
-          # Validate only that Raydium returned decodable serialized bytes.
-          tx_bytes = base64.b64decode(tx_b64, validate=True)
-          if not tx_bytes:
-              raise SystemExit("Returned serialized transaction is empty")
+          tx_payloads = []
+          for index, item in enumerate(tx_entries, start=1):
+              tx_b64 = item["transaction"]
+              tx_bytes = base64.b64decode(tx_b64, validate=True)
+              if not tx_bytes:
+                  raise SystemExit(
+                      f"Returned serialized transaction #{index} is empty"
+                  )
+              filename = f"unsigned_transaction_{index}.base64"
+              (out / filename).write_text(tx_b64 + "\n", encoding="ascii")
+              tx_payloads.append({
+                  "index": index,
+                  "serialized_transaction_base64_file": filename,
+                  "serialized_transaction_sha256": sha(tx_bytes),
+                  "serialized_transaction_bytes": len(tx_bytes),
+              })
 
           quote_output = int(data["outputAmount"])
           evidence = {
@@ -234,10 +262,8 @@ jobs:
                   "completed_at_utc": build_completed,
                   "request_sha256": sha(build_request),
                   "response_sha256": sha(build_raw),
-                  "serialized_transaction_sha256": sha(tx_bytes),
-                  "serialized_transaction_base64_file":
-                      "unsigned_transaction.base64",
-                  "serialized_transaction_bytes": len(tx_bytes),
+                  "transaction_count": len(tx_payloads),
+                  "transactions": tx_payloads,
                   "tx_version": TX_VERSION,
                   "compute_unit_price_micro_lamports":
                       PRIORITY_MICROLAMPORTS,
@@ -258,9 +284,6 @@ jobs:
           }
 
           # Keep serialized unsigned material separate from the JSON evidence.
-          (out / "unsigned_transaction.base64").write_text(
-              tx_b64 + "\n", encoding="ascii"
-          )
           write_json(out / "evidence.json", evidence)
 
           manifest = []
