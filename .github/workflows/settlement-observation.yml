@@ -1,0 +1,298 @@
+name: Settlement Observation
+
+on:
+  workflow_dispatch:
+    inputs:
+      signature:
+        description: "Finalized public Solana transaction signature"
+        required: true
+        type: string
+      wallet:
+        description: "Public Solana wallet address only"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Read finalized settlement from Solana RPC
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Capture settlement evidence
+        shell: bash
+        env:
+          SIGNATURE: ${{ inputs.signature }}
+          WALLET: ${{ inputs.wallet }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import os
+          import re
+          import ssl
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          RPC = "https://api.mainnet-beta.solana.com"
+          USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00", "Z")
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def validate(value, label, lo, hi):
+              value = value.strip()
+              if not (lo <= len(value) <= hi) or not BASE58.fullmatch(value):
+                  raise SystemExit(f"Invalid {label}")
+              return value
+
+          def rpc_call(method, params, request_id):
+              parsed = urlparse(RPC)
+              body = json.dumps(
+                  {
+                      "jsonrpc": "2.0",
+                      "id": request_id,
+                      "method": method,
+                      "params": params,
+                  },
+                  separators=(",", ":"),
+              ).encode("utf-8")
+
+              request_bytes = (
+                  "POST / HTTP/1.1\r\n"
+                  f"Host: {parsed.netloc}\r\n"
+                  "User-Agent: Scout-Settlement-Observation/1.0.0\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Accept: application/json\r\n"
+                  "Accept-Encoding: identity\r\n"
+                  f"Content-Length: {len(body)}\r\n"
+                  "Connection: close\r\n\r\n"
+              ).encode("utf-8") + body
+
+              started = now()
+              mono = time.monotonic_ns()
+              conn = http.client.HTTPSConnection(
+                  parsed.hostname,
+                  parsed.port or 443,
+                  timeout=30,
+                  context=ssl.create_default_context(),
+              )
+              try:
+                  conn.request(
+                      "POST",
+                      "/",
+                      body=body,
+                      headers={
+                          "User-Agent": "Scout-Settlement-Observation/1.0.0",
+                          "Content-Type": "application/json",
+                          "Accept": "application/json",
+                          "Accept-Encoding": "identity",
+                          "Connection": "close",
+                      },
+                  )
+                  response = conn.getresponse()
+                  raw = response.read()
+                  status = response.status
+              finally:
+                  conn.close()
+
+              return {
+                  "method": method,
+                  "endpoint": RPC,
+                  "started_at_utc": started,
+                  "completed_at_utc": now(),
+                  "duration_ms": round(
+                      (time.monotonic_ns() - mono) / 1_000_000, 3
+                  ),
+                  "http_status": status,
+                  "request_bytes": request_bytes,
+                  "response_bytes": raw,
+                  "request_sha256": sha256(request_bytes),
+                  "response_sha256": sha256(raw),
+                  "json": json.loads(raw.decode("utf-8")),
+              }
+
+          def token_sum(entries, owner, mint):
+              total = 0
+              for entry in entries or []:
+                  if not isinstance(entry, dict):
+                      continue
+                  if entry.get("owner") != owner or entry.get("mint") != mint:
+                      continue
+                  amount = (entry.get("uiTokenAmount") or {}).get("amount")
+                  if isinstance(amount, str) and amount.isdigit():
+                      total += int(amount)
+              return total
+
+          signature = validate(os.environ["SIGNATURE"], "signature", 64, 100)
+          wallet = validate(os.environ["WALLET"], "wallet", 32, 50)
+
+          out = Path("settlement-evidence")
+          out.mkdir()
+
+          status_rpc = rpc_call(
+              "getSignatureStatuses",
+              [[signature], {"searchTransactionHistory": True}],
+              1,
+          )
+          (out / "status_request.http").write_bytes(status_rpc["request_bytes"])
+          (out / "status_response.body").write_bytes(status_rpc["response_bytes"])
+
+          tx_rpc = rpc_call(
+              "getTransaction",
+              [
+                  signature,
+                  {
+                      "commitment": "finalized",
+                      "encoding": "json",
+                      "maxSupportedTransactionVersion": 0,
+                  },
+              ],
+              2,
+          )
+          (out / "transaction_request.http").write_bytes(tx_rpc["request_bytes"])
+          (out / "transaction_response.body").write_bytes(tx_rpc["response_bytes"])
+
+          status_value = None
+          status_result = status_rpc["json"].get("result")
+          if isinstance(status_result, dict):
+              values = status_result.get("value")
+              if isinstance(values, list) and values:
+                  status_value = values[0]
+
+          finalized = (
+              status_rpc["http_status"] == 200
+              and isinstance(status_value, dict)
+              and status_value.get("err") is None
+              and status_value.get("confirmationStatus") == "finalized"
+          )
+
+          tx_result = tx_rpc["json"].get("result")
+          if not isinstance(tx_result, dict):
+              raise SystemExit("Transaction not returned by RPC")
+
+          meta = tx_result.get("meta")
+          transaction = tx_result.get("transaction")
+          if not isinstance(meta, dict) or not isinstance(transaction, dict):
+              raise SystemExit("Transaction metadata missing")
+
+          signatures = transaction.get("signatures") or []
+          success = (
+              tx_rpc["http_status"] == 200
+              and meta.get("err") is None
+              and signature in signatures
+          )
+
+          pre_usdc = token_sum(meta.get("preTokenBalances"), wallet, USDC)
+          post_usdc = token_sum(meta.get("postTokenBalances"), wallet, USDC)
+          delta_usdc = post_usdc - pre_usdc
+
+          message = transaction.get("message") if isinstance(transaction, dict) else None
+          account_keys = []
+          if isinstance(message, dict):
+              keys = message.get("accountKeys")
+              if isinstance(keys, list):
+                  for key in keys:
+                      if isinstance(key, str):
+                          account_keys.append(key)
+                      elif isinstance(key, dict) and isinstance(key.get("pubkey"), str):
+                          account_keys.append(key["pubkey"])
+
+          evidence = {
+              "schema": "scout.settlement_observation.v1",
+              "observation_only": True,
+              "execution_authority": False,
+              "signature": signature,
+              "wallet": wallet,
+              "finalized": finalized,
+              "transaction_success": success,
+              "slot": tx_result.get("slot"),
+              "block_time": tx_result.get("blockTime"),
+              "network_fee_lamports": meta.get("fee"),
+              "compute_units_consumed": meta.get("computeUnitsConsumed"),
+              "pre_usdc_base_units": pre_usdc,
+              "post_usdc_base_units": post_usdc,
+              "actual_usdc_delta_base_units": delta_usdc,
+              "actual_usdc_delta_units": delta_usdc / 1_000_000,
+              "account_keys": account_keys,
+              "rpc_evidence": {
+                  "status": {
+                      "endpoint": status_rpc["endpoint"],
+                      "method": status_rpc["method"],
+                      "http_status": status_rpc["http_status"],
+                      "started_at_utc": status_rpc["started_at_utc"],
+                      "completed_at_utc": status_rpc["completed_at_utc"],
+                      "request_sha256": status_rpc["request_sha256"],
+                      "response_sha256": status_rpc["response_sha256"],
+                  },
+                  "transaction": {
+                      "endpoint": tx_rpc["endpoint"],
+                      "method": tx_rpc["method"],
+                      "http_status": tx_rpc["http_status"],
+                      "started_at_utc": tx_rpc["started_at_utc"],
+                      "completed_at_utc": tx_rpc["completed_at_utc"],
+                      "request_sha256": tx_rpc["request_sha256"],
+                      "response_sha256": tx_rpc["response_sha256"],
+                  },
+              },
+              "safety": {
+                  "private_key": False,
+                  "seed_phrase": False,
+                  "signer": False,
+                  "transaction_builder": False,
+                  "transaction_signing": False,
+                  "transaction_submission": False,
+                  "broadcast": False,
+                  "capital_movement": False,
+              },
+          }
+
+          (out / "evidence.json").write_text(
+              json.dumps(evidence, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          manifest = []
+          for path in sorted(out.iterdir()):
+              if path.is_file() and path.name != "manifest.sha256":
+                  manifest.append(f"{sha256(path.read_bytes())}  {path.name}")
+          (out / "manifest.sha256").write_text(
+              "\n".join(manifest) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "finalized": finalized,
+              "transaction_success": success,
+              "slot": evidence["slot"],
+              "block_time": evidence["block_time"],
+              "network_fee_lamports": evidence["network_fee_lamports"],
+              "compute_units_consumed": evidence["compute_units_consumed"],
+              "actual_usdc_delta_units": evidence["actual_usdc_delta_units"],
+              "execution_authority": False,
+          }, indent=2))
+
+          if not finalized or not success:
+              raise SystemExit("Settlement observation did not validate")
+          PY
+
+      - name: Upload settlement evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: settlement-observation-${{ github.run_id }}
+          path: settlement-evidence/
+          if-no-files-found: error
+          retention-days: 30
