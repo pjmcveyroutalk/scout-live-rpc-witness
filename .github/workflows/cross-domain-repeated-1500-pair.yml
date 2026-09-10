@@ -1,0 +1,41 @@
+name: Cross-Domain Repeated 1500 Pair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat-1500:
+    name: Eight tightly paired 1500-USDC read-only observations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Capture repeated 1500-USDC paired observations
+        run: python3 repeated_1500_pair.py
+
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf repeated-1500-pair-evidence.tgz live-evidence
+          sha256sum repeated-1500-pair-evidence.tgz > repeated-1500-pair-evidence.tgz.sha256
+
+      - name: Upload repeated 1500 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-domain-repeated-1500-pair-${{ github.run_id }}
+          path: |
+            live-evidence/
+            repeated-1500-pair-evidence.tgz
+            repeated-1500-pair-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
