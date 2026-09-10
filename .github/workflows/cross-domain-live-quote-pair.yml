@@ -1,0 +1,47 @@
+name: Cross-Domain Live Quote Pair Witness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-domain-pair:
+    name: Solana + Arbitrum read-only pair capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Capture genuine Raydium SOL-USDC quote
+        run: python3 raydium_quote_witness.py capture --output live-evidence
+
+      - name: Capture genuine Arbitrum WETH-USDC quote
+        run: python3 arbitrum_quote_witness.py capture --output live-evidence
+
+      - name: Package exact paired evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf cross-domain-live-quote-pair-evidence.tgz live-evidence
+          sha256sum cross-domain-live-quote-pair-evidence.tgz > cross-domain-live-quote-pair-evidence.tgz.sha256
+
+      - name: Upload paired evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-domain-live-quote-pair-${{ github.run_id }}
+          path: |
+            live-evidence/
+            cross-domain-live-quote-pair-evidence.tgz
+            cross-domain-live-quote-pair-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
