@@ -1,0 +1,303 @@
+name: T679 Raydium Unsigned Micro-Swap Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      wallet:
+        description: "Public Solana wallet address only — never a private key or seed phrase"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-unsigned:
+    name: Fresh quote + unsigned transaction package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Capture fresh quote and build unsigned transaction
+        shell: bash
+        env:
+          PUBLIC_WALLET: ${{ inputs.wallet }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import http.client
+          import json
+          import os
+          import re
+          import ssl
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+
+          HOST = "transaction-v1.raydium.io"
+          SOL = "So11111111111111111111111111111111111111112"
+          USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          AMOUNT = 1_000_000  # 0.001 SOL
+          SLIPPAGE_BPS = 50
+          TX_VERSION = "V0"
+          PRIORITY_MICROLAMPORTS = "1000"
+          WALLET_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,50}$")
+
+          def now():
+              return datetime.now(timezone.utc).isoformat(
+                  timespec="microseconds"
+              ).replace("+00:00", "Z")
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def write_json(path, value):
+              path.write_text(
+                  json.dumps(value, sort_keys=True, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+
+          wallet = os.environ["PUBLIC_WALLET"].strip()
+          if not WALLET_RE.fullmatch(wallet):
+              raise SystemExit("Invalid public Solana wallet address")
+
+          root = Path("live-evidence")
+          root.mkdir(exist_ok=True)
+          stamp = now().replace(":", "").replace("-", "").replace(".", "_")
+          out = root / f"t679-unsigned-micro-swap-{stamp}"
+          out.mkdir()
+
+          query = urlencode([
+              ("inputMint", SOL),
+              ("outputMint", USDC),
+              ("amount", str(AMOUNT)),
+              ("slippageBps", str(SLIPPAGE_BPS)),
+              ("txVersion", TX_VERSION),
+          ])
+          quote_target = f"/compute/swap-base-in?{query}"
+
+          quote_request = (
+              f"GET {quote_target} HTTP/1.1\r\n"
+              f"Host: {HOST}\r\n"
+              "Accept: application/json\r\n"
+              "Accept-Encoding: identity\r\n"
+              "Cache-Control: no-cache\r\n"
+              "Connection: close\r\n\r\n"
+          ).encode("ascii")
+
+          quote_started = now()
+          conn = http.client.HTTPSConnection(
+              HOST, 443, timeout=30, context=ssl.create_default_context()
+          )
+          try:
+              conn.putrequest(
+                  "GET",
+                  quote_target,
+                  skip_host=True,
+                  skip_accept_encoding=True,
+              )
+              for key, value in [
+                  ("Host", HOST),
+                  ("Accept", "application/json"),
+                  ("Accept-Encoding", "identity"),
+                  ("Cache-Control", "no-cache"),
+                  ("Connection", "close"),
+              ]:
+                  conn.putheader(key, value)
+              conn.endheaders()
+              response = conn.getresponse()
+              quote_status = response.status
+              quote_raw = response.read()
+          finally:
+              conn.close()
+          quote_completed = now()
+
+          (out / "quote_request.http").write_bytes(quote_request)
+          (out / "quote_response.body").write_bytes(quote_raw)
+
+          quote = json.loads(quote_raw.decode("utf-8"))
+          data = quote.get("data") if isinstance(quote, dict) else None
+          quote_ok = (
+              quote_status == 200
+              and isinstance(quote, dict)
+              and quote.get("success") is True
+              and isinstance(data, dict)
+              and data.get("inputMint") == SOL
+              and data.get("outputMint") == USDC
+              and str(data.get("inputAmount")) == str(AMOUNT)
+              and str(data.get("outputAmount", "")).isdigit()
+              and int(data["outputAmount"]) > 0
+          )
+          if not quote_ok:
+              raise SystemExit("Fresh Raydium quote validation failed")
+
+          build_body_obj = {
+              "wallet": wallet,
+              "swapResponse": quote,
+              "txVersion": TX_VERSION,
+              "computeUnitPriceMicroLamports": PRIORITY_MICROLAMPORTS,
+              "wrapSol": True,
+              "unwrapSol": False,
+          }
+          build_body = json.dumps(
+              build_body_obj, separators=(",", ":")
+          ).encode("utf-8")
+          build_target = "/transaction/swap-base-in"
+          build_request = (
+              f"POST {build_target} HTTP/1.1\r\n"
+              f"Host: {HOST}\r\n"
+              "Content-Type: application/json\r\n"
+              "Accept: application/json\r\n"
+              "Accept-Encoding: identity\r\n"
+              f"Content-Length: {len(build_body)}\r\n"
+              "Connection: close\r\n\r\n"
+          ).encode("ascii") + build_body
+
+          build_started = now()
+          conn = http.client.HTTPSConnection(
+              HOST, 443, timeout=30, context=ssl.create_default_context()
+          )
+          try:
+              conn.putrequest(
+                  "POST",
+                  build_target,
+                  skip_host=True,
+                  skip_accept_encoding=True,
+              )
+              for key, value in [
+                  ("Host", HOST),
+                  ("Content-Type", "application/json"),
+                  ("Accept", "application/json"),
+                  ("Accept-Encoding", "identity"),
+                  ("Content-Length", str(len(build_body))),
+                  ("Connection", "close"),
+              ]:
+                  conn.putheader(key, value)
+              conn.endheaders(build_body)
+              response = conn.getresponse()
+              build_status = response.status
+              build_raw = response.read()
+          finally:
+              conn.close()
+          build_completed = now()
+
+          (out / "build_request.http").write_bytes(build_request)
+          (out / "build_response.body").write_bytes(build_raw)
+
+          built = json.loads(build_raw.decode("utf-8"))
+          built_data = built.get("data") if isinstance(built, dict) else None
+          tx_b64 = (
+              built_data.get("transaction")
+              if isinstance(built_data, dict)
+              else None
+          )
+          build_ok = (
+              build_status == 200
+              and isinstance(built, dict)
+              and built.get("success") is True
+              and isinstance(tx_b64, str)
+              and len(tx_b64) > 0
+          )
+          if not build_ok:
+              raise SystemExit("Raydium unsigned transaction build failed")
+
+          # Validate only that Raydium returned decodable serialized bytes.
+          tx_bytes = base64.b64decode(tx_b64, validate=True)
+          if not tx_bytes:
+              raise SystemExit("Returned serialized transaction is empty")
+
+          quote_output = int(data["outputAmount"])
+          evidence = {
+              "schema": "scout.t679.raydium_unsigned_micro_swap.v1",
+              "accepted": True,
+              "chain": "solana-mainnet",
+              "provider": "raydium",
+              "execution_authority": False,
+              "wallet_address_public": wallet,
+              "decision_quote": {
+                  "input_asset": "SOL",
+                  "input_amount_base_units": AMOUNT,
+                  "input_units": 0.001,
+                  "output_asset": "USDC",
+                  "output_mint": USDC,
+                  "quoted_output_base_units": quote_output,
+                  "quoted_output_units": quote_output / 1_000_000,
+                  "started_at_utc": quote_started,
+                  "completed_at_utc": quote_completed,
+                  "request_sha256": sha(quote_request),
+                  "response_sha256": sha(quote_raw),
+              },
+              "unsigned_transaction_build": {
+                  "started_at_utc": build_started,
+                  "completed_at_utc": build_completed,
+                  "request_sha256": sha(build_request),
+                  "response_sha256": sha(build_raw),
+                  "serialized_transaction_sha256": sha(tx_bytes),
+                  "serialized_transaction_base64_file":
+                      "unsigned_transaction.base64",
+                  "serialized_transaction_bytes": len(tx_bytes),
+                  "tx_version": TX_VERSION,
+                  "compute_unit_price_micro_lamports":
+                      PRIORITY_MICROLAMPORTS,
+                  "wrap_sol": True,
+                  "unwrap_sol": False,
+              },
+              "safety": {
+                  "private_key": False,
+                  "seed_phrase": False,
+                  "signer": False,
+                  "transaction_builder": True,
+                  "transaction_serialization_received": True,
+                  "transaction_signing": False,
+                  "transaction_submission": False,
+                  "broadcast": False,
+                  "capital_movement": False,
+              },
+          }
+
+          # Keep serialized unsigned material separate from the JSON evidence.
+          (out / "unsigned_transaction.base64").write_text(
+              tx_b64 + "\n", encoding="ascii"
+          )
+          write_json(out / "evidence.json", evidence)
+
+          manifest = []
+          for path in sorted(out.iterdir()):
+              if path.is_file() and path.name != "manifest.sha256":
+                  manifest.append(f"{sha(path.read_bytes())}  {path.name}")
+          (out / "manifest.sha256").write_text(
+              "\n".join(manifest) + "\n", encoding="utf-8"
+          )
+
+          print(json.dumps({
+              "accepted": True,
+              "quoted_output_units_usdc": quote_output / 1_000_000,
+              "execution_authority": False,
+              "transaction_built": True,
+              "transaction_signed": False,
+              "transaction_submitted": False,
+              "capital_movement": False,
+          }, indent=2))
+          PY
+
+      - name: Package evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf t679-unsigned-micro-swap-evidence.tgz live-evidence
+          sha256sum t679-unsigned-micro-swap-evidence.tgz \
+            > t679-unsigned-micro-swap-evidence.tgz.sha256
+
+      - name: Upload unsigned package
+        uses: actions/upload-artifact@v4
+        with:
+          name: t679-unsigned-micro-swap-${{ github.run_id }}
+          path: |
+            live-evidence/
+            t679-unsigned-micro-swap-evidence.tgz
+            t679-unsigned-micro-swap-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
