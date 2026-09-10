@@ -1,0 +1,42 @@
+name: Cross-Domain Tight Paired Extended Curve
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tight-paired-extended-curve:
+    name: Tight paired USDC-USDT 250-to-10000 read-only curve
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout witness repository
+        uses: actions/checkout@v4
+
+      - name: Capture tightly paired extended size curve
+        run: python3 tight_paired_extended_curve.py
+
+      - name: Package exact evidence bytes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf tight-paired-extended-curve-evidence.tgz live-evidence
+          sha256sum tight-paired-extended-curve-evidence.tgz > tight-paired-extended-curve-evidence.tgz.sha256
+
+      - name: Upload tightly paired curve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-domain-tight-paired-extended-curve-${{ github.run_id }}
+          path: |
+            live-evidence/
+            tight-paired-extended-curve-evidence.tgz
+            tight-paired-extended-curve-evidence.tgz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+
