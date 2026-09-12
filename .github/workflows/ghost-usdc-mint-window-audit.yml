@@ -1,0 +1,35 @@
+name: Ghost USDC Mint Window Audit
+
+on:
+  push:
+    paths:
+      - "ghost_g0/ghost_usdc_mint_window_audit.py"
+      - ".github/workflows/ghost-usdc-mint-window-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit USDC mint writes in shadow window
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile audit
+        run: python3 -m py_compile ghost_g0/ghost_usdc_mint_window_audit.py
+      - name: Run audit
+        run: |
+          mkdir -p ghost-usdc-window-audit
+          python3 ghost_g0/ghost_usdc_mint_window_audit.py \
+            --s0-slot 446436389 \
+            --s1-slot 446436421 \
+            --target-signature 45pCTtpSXErpwtNCn6E644MWQAtMw9vF3gwDTFCtZaH8EUCZXaWocDP4zNzagL6fdbBDEeu3Rx1Gb4b2tcJPsKeC \
+            --output ghost-usdc-window-audit/USDC_MINT_WINDOW_AUDIT.json
+      - name: Upload audit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-usdc-mint-window-audit-${{ github.run_id }}
+          path: ghost-usdc-window-audit/
+          if-no-files-found: error
