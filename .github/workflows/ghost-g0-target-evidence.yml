@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - ".github/workflows/ghost-g0-target-evidence.yml"
+      - "ghost_g0/ghost_g0_common.py"
+      - "ghost_g0/ghost_g0_target_evidence.py"
+      - "ghost_g0/ghost_g0_top_level_target_evidence.py"
   workflow_dispatch:
 
 permissions:
@@ -25,13 +28,14 @@ jobs:
           set -euo pipefail
           python3 -m py_compile \
             ghost_g0/ghost_g0_common.py \
-            ghost_g0/ghost_g0_target_evidence.py
+            ghost_g0/ghost_g0_target_evidence.py \
+            ghost_g0/ghost_g0_top_level_target_evidence.py
 
-      - name: Capture locked-target evidence
+      - name: Capture top-level locked-target evidence
         shell: bash
         run: |
           set +e
-          python3 ghost_g0/ghost_g0_target_evidence.py \
+          python3 ghost_g0/ghost_g0_top_level_target_evidence.py \
             --rpc-url https://api.mainnet-beta.solana.com \
             --pool-id fAjTnZ9QqJkUmrr8cXutkYhpVge2qqtSZNt9qKn7YC2 \
             --output-dir ghost-g0-evidence \
