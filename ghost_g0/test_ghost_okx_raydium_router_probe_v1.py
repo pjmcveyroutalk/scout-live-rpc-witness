@@ -1,12 +1,21 @@
 import unittest
 
-from ghost_okx_raydium_router_probe_v0 import (
-    ProbeError,
-    RAYDIUM_CPMM,
-    SPL_TOKEN,
-    SWAP_TOB_DISCRIMINATOR,
-)
-from ghost_okx_raydium_router_probe_v1 import derive_direct_root_raydium_leg_v1
+try:
+    from .ghost_okx_raydium_router_probe_v0 import (
+        ProbeError,
+        RAYDIUM_CPMM,
+        SPL_TOKEN,
+        SWAP_TOB_DISCRIMINATOR,
+    )
+    from .ghost_okx_raydium_router_probe_v1 import derive_direct_root_raydium_leg_v1
+except ImportError:
+    from ghost_okx_raydium_router_probe_v0 import (
+        ProbeError,
+        RAYDIUM_CPMM,
+        SPL_TOKEN,
+        SWAP_TOB_DISCRIMINATOR,
+    )
+    from ghost_okx_raydium_router_probe_v1 import derive_direct_root_raydium_leg_v1
 
 
 def swap_tob(routes, amount):
