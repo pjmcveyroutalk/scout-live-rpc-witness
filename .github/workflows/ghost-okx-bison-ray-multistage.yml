@@ -1,0 +1,61 @@
+name: Ghost OKX Bison Raydium Multi-Stage
+
+on:
+  push:
+    paths:
+      - "ghost_g0/ghost_okx_bison_raydium_multistage_capture_v0.py"
+      - ".github/workflows/ghost-okx-bison-ray-multistage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Seal BisonFi to Raydium multi-stage blind corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout witness repo
+        uses: actions/checkout@v4
+
+      - name: Validate isolated collector
+        run: |
+          python3 -m py_compile \
+            ghost_g0/ghost_okx_raydium_router_probe_v0.py \
+            ghost_g0/ghost_okx_router_shadow_v0.py \
+            ghost_g0/ghost_okx_bison_raydium_multistage_capture_v0.py
+
+      - name: Capture fresh multi-stage corpus
+        shell: bash
+        run: |
+          set +e
+          python3 ghost_g0/ghost_okx_bison_raydium_multistage_capture_v0.py \
+            --rpc-url https://api.mainnet-beta.solana.com \
+            --output-dir ghost-okx-bison-ray-multistage \
+            --max-runtime-seconds 900 \
+            --poll-seconds 2.0 \
+            --request-timeout-seconds 20 \
+            --finalization-timeout-seconds 120
+          code=$?
+          mkdir -p ghost-okx-bison-ray-multistage
+          printf '%s\n' "$code" > ghost-okx-bison-ray-multistage/CAPTURE_EXIT_CODE.txt
+          if [ -f ghost-okx-bison-ray-multistage/CORPUS_CAPTURED.json ]; then
+            echo "Ghost multi-stage corpus: CAPTURED"
+          elif [ -f ghost-okx-bison-ray-multistage/NOT_FOUND.json ]; then
+            echo "Ghost multi-stage corpus: NO_CASE_IN_WINDOW"
+          elif [ -f ghost-okx-bison-ray-multistage/FATAL.json ]; then
+            echo "Ghost multi-stage corpus: FATAL_EVIDENCE_PRESERVED"
+          else
+            echo "Ghost multi-stage corpus: UNKNOWN_EVIDENCE_PRESERVED"
+          fi
+          exit 0
+
+      - name: Upload immutable multi-stage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-okx-bison-ray-multistage-${{ github.run_id }}
+          path: ghost-okx-bison-ray-multistage/
+          if-no-files-found: error
+          retention-days: 30
