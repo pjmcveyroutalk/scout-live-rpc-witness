@@ -1,0 +1,63 @@
+name: Ghost G0 Locked Target Evidence
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ghost-g0-target-evidence.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capture locked target truth evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout witness repo
+        uses: actions/checkout@v4
+
+      - name: Validate isolated acquisition sensor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            ghost_g0/ghost_g0_common.py \
+            ghost_g0/ghost_g0_target_evidence.py
+
+      - name: Capture locked-target evidence
+        shell: bash
+        run: |
+          set +e
+          python3 ghost_g0/ghost_g0_target_evidence.py \
+            --rpc-url https://api.mainnet-beta.solana.com \
+            --pool-id fAjTnZ9QqJkUmrr8cXutkYhpVge2qqtSZNt9qKn7YC2 \
+            --output-dir ghost-g0-evidence \
+            --max-runtime-seconds 720 \
+            --poll-seconds 2.5 \
+            --request-timeout-seconds 20 \
+            --finalization-timeout-seconds 120
+          code=$?
+          mkdir -p ghost-g0-evidence
+          printf '%s\n' "$code" > ghost-g0-evidence/COLLECTOR_EXIT_CODE.txt
+          if [ -f ghost-g0-evidence/READY_FOR_OFFLINE_ADMISSION.json ]; then
+            echo "Ghost G0 acquisition state: EVIDENCE_READY"
+          elif [ -f ghost-g0-evidence/NOT_FOUND.json ]; then
+            echo "Ghost G0 acquisition state: NO_ADMISSIBLE_CASE_IN_WINDOW"
+          elif [ -f ghost-g0-evidence/FATAL.json ]; then
+            echo "Ghost G0 acquisition state: FATAL_EVIDENCE_PRESERVED"
+          else
+            echo "Ghost G0 acquisition state: UNKNOWN_EVIDENCE_PRESERVED"
+          fi
+          exit 0
+
+      - name: Upload immutable acquisition evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-g0-target-evidence-${{ github.run_id }}
+          path: ghost-g0-evidence/
+          if-no-files-found: error
+          retention-days: 30
