@@ -14,17 +14,30 @@ from __future__ import annotations
 
 from typing import Any
 
-from ghost_okx_raydium_router_probe_v0 import (
-    OKX_ROUTER,
-    ProbeError,
-    RAYDIUM_ADAPTER_BLOCK_LEN,
-    RAYDIUM_CPMM,
-    RAYDIUM_CPMM_DEX_TAG,
-    SHARE_DENOMINATOR,
-    SPL_TOKEN,
-    SWAP_TOB_FIXED_ACCOUNT_COUNT,
-    decode_swap_tob,
-)
+try:
+    from .ghost_okx_raydium_router_probe_v0 import (
+        OKX_ROUTER,
+        ProbeError,
+        RAYDIUM_ADAPTER_BLOCK_LEN,
+        RAYDIUM_CPMM,
+        RAYDIUM_CPMM_DEX_TAG,
+        SHARE_DENOMINATOR,
+        SPL_TOKEN,
+        SWAP_TOB_FIXED_ACCOUNT_COUNT,
+        decode_swap_tob,
+    )
+except ImportError:
+    from ghost_okx_raydium_router_probe_v0 import (
+        OKX_ROUTER,
+        ProbeError,
+        RAYDIUM_ADAPTER_BLOCK_LEN,
+        RAYDIUM_CPMM,
+        RAYDIUM_CPMM_DEX_TAG,
+        SHARE_DENOMINATOR,
+        SPL_TOKEN,
+        SWAP_TOB_FIXED_ACCOUNT_COUNT,
+        decode_swap_tob,
+    )
 
 
 def _allocation(stage_amount: int, routes: list[dict[str, int]]) -> list[int]:
