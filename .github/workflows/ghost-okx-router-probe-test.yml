@@ -1,0 +1,27 @@
+name: Ghost OKX Router Probe Test
+
+on:
+  push:
+    paths:
+      - "ghost_g0/ghost_okx_raydium_router_probe_v0.py"
+      - "ghost_g0/test_ghost_okx_raydium_router_probe_v0.py"
+      - ".github/workflows/ghost-okx-router-probe-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Validate fail-closed OKX to Raydium probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile probe
+        run: |
+          python3 -m py_compile \
+            ghost_g0/ghost_okx_raydium_router_probe_v0.py \
+            ghost_g0/test_ghost_okx_raydium_router_probe_v0.py
+      - name: Run fail-closed tests
+        run: python3 -m unittest -v ghost_g0/test_ghost_okx_raydium_router_probe_v0.py
