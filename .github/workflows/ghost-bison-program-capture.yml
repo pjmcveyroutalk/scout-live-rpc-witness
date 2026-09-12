@@ -1,0 +1,33 @@
+name: Ghost Bison Program Capture
+
+on:
+  push:
+    paths:
+      - "ghost_g0/ghost_bison_program_capture.py"
+      - ".github/workflows/ghost-bison-program-capture.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capture public BisonFi executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate capture tool
+        run: python3 -m py_compile ghost_g0/ghost_bison_program_capture.py
+      - name: Capture finalized BisonFi program
+        run: |
+          python3 ghost_g0/ghost_bison_program_capture.py \
+            --rpc-url https://api.mainnet-beta.solana.com \
+            --output-dir ghost-bison-program
+      - name: Upload immutable program evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-bison-program-${{ github.run_id }}
+          path: ghost-bison-program/
+          if-no-files-found: error
+          retention-days: 30
