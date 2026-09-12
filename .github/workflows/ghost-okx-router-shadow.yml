@@ -3,6 +3,7 @@ name: Ghost OKX Raydium Shadow
 on:
   push:
     paths:
+      - "ghost_g0/ghost_okx_router_shadow_v1.py"
       - ".github/workflows/ghost-okx-router-shadow.yml"
   workflow_dispatch:
 
@@ -11,7 +12,7 @@ permissions:
 
 jobs:
   shadow:
-    name: Precommit OKX to Raydium state projection
+    name: Precommit near-tip OKX to Raydium state projection
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -23,33 +24,34 @@ jobs:
           python3 -m py_compile \
             ghost_g0/ghost_okx_raydium_router_probe_v0.py \
             ghost_g0/ghost_ray_cpmm_state_transition_v0.py \
-            ghost_g0/ghost_okx_router_shadow_v0.py
+            ghost_g0/ghost_okx_router_shadow_v0.py \
+            ghost_g0/ghost_okx_router_shadow_v1.py
           python3 -m unittest -v ghost_g0/test_ghost_okx_raydium_router_probe_v0.py
 
-      - name: Run fresh precommit shadow test
+      - name: Run fresh near-tip precommit shadow test
         shell: bash
         run: |
           set +e
-          python3 ghost_g0/ghost_okx_router_shadow_v0.py \
+          python3 ghost_g0/ghost_okx_router_shadow_v1.py \
             --rpc-url https://api.mainnet-beta.solana.com \
-            --output-dir ghost-okx-router-shadow \
+            --output-dir ghost-okx-router-shadow-v1 \
             --max-runtime-seconds 900 \
-            --poll-seconds 2.5 \
+            --poll-seconds 1.5 \
             --request-timeout-seconds 20 \
             --finalization-timeout-seconds 120
           code=$?
-          mkdir -p ghost-okx-router-shadow
-          printf '%s\n' "$code" > ghost-okx-router-shadow/SHADOW_EXIT_CODE.txt
-          if [ -f ghost-okx-router-shadow/SHADOW_PASS.json ]; then
-            echo "Ghost router shadow state: PASS"
-          elif [ -f ghost-okx-router-shadow/SHADOW_REJECT.json ]; then
-            echo "Ghost router shadow state: REJECT"
-          elif [ -f ghost-okx-router-shadow/NOT_FOUND.json ]; then
-            echo "Ghost router shadow state: NO_CASE_IN_WINDOW"
-          elif [ -f ghost-okx-router-shadow/FATAL.json ]; then
-            echo "Ghost router shadow state: FATAL_EVIDENCE_PRESERVED"
+          mkdir -p ghost-okx-router-shadow-v1
+          printf '%s\n' "$code" > ghost-okx-router-shadow-v1/SHADOW_EXIT_CODE.txt
+          if [ -f ghost-okx-router-shadow-v1/SHADOW_PASS.json ]; then
+            echo "Ghost router shadow v1 state: PASS"
+          elif [ -f ghost-okx-router-shadow-v1/SHADOW_REJECT.json ]; then
+            echo "Ghost router shadow v1 state: PROJECTOR_REJECT"
+          elif [ -f ghost-okx-router-shadow-v1/NOT_FOUND.json ]; then
+            echo "Ghost router shadow v1 state: NO_CLEAN_CASE_IN_WINDOW"
+          elif [ -f ghost-okx-router-shadow-v1/FATAL.json ]; then
+            echo "Ghost router shadow v1 state: FATAL_EVIDENCE_PRESERVED"
           else
-            echo "Ghost router shadow state: UNKNOWN_EVIDENCE_PRESERVED"
+            echo "Ghost router shadow v1 state: UNKNOWN_EVIDENCE_PRESERVED"
           fi
           exit 0
 
@@ -57,7 +59,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ghost-okx-router-shadow-${{ github.run_id }}
-          path: ghost-okx-router-shadow/
+          name: ghost-okx-router-shadow-v1-${{ github.run_id }}
+          path: ghost-okx-router-shadow-v1/
           if-no-files-found: error
           retention-days: 30
